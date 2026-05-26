@@ -22,6 +22,7 @@ Three antenna positions under test:
 | `rfid_reader.c`            | C program that talks to the CAEN reader, continuously inventories both antennas, and prints every **new unique** EPC with timestamp and antenna name. Dedupes for its entire process lifetime — see "How throws are isolated" below. |
 | `compile.sh`               | Builds `rfid_reader` from `rfid_reader.c` + the `SRC/` CAEN light library. |
 | `antenna_test_logger.py`   | **The test harness.** Wraps `rfid_reader`, presents a per-throw menu, hot-switches between the 3 setups, drives the same WS2812 + GPIO13 LED feedback as `rfid_led.py`, and appends results to `results.xlsx` with embedded setup photos. |
+| `run_test.sh`              | One-shot runner: same checks as `system.sh` (CAEN library, USB perms, compile) and auto-sudo for LED access, then launches `antenna_test_logger.py`. Preferred entry point for a test session. |
 | `rfid_led.py`              | Standalone LED-only bridge — drives the WS2812 strip green on every new tag, no logging. Useful as a quick LED hardware check when you don't need a test session. (Can't run at the same time as the logger — both spawn `rfid_reader`.) |
 | `system.sh`                | One-shot runner for the standalone LED-only flow (compiles + launches `rfid_led.py`). |
 | `requirements.txt`         | Python deps needed by the logger: `openpyxl`, `Pillow`. |
@@ -39,7 +40,7 @@ Three antenna positions under test:
 
 ```bash
 # 1. Make scripts executable (first time only)
-chmod +x compile.sh system.sh
+chmod +x compile.sh system.sh run_test.sh
 
 # 2. Build the C reader
 ./compile.sh
@@ -59,7 +60,14 @@ sudo pip3 install --break-system-packages rpi_ws281x
 
 ## Run a test session
 
-The WS2812 LED strip needs root for PWM/DMA access, so launch with sudo:
+Easiest — one-shot runner (compiles, checks USB, auto-sudo for WS2812):
+
+```bash
+./run_test.sh
+```
+
+Or run the Python directly. The WS2812 LED strip needs root for PWM/DMA
+access, so launch with sudo:
 
 ```bash
 sudo python3 antenna_test_logger.py
