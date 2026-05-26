@@ -1,0 +1,6 @@
+# Ensure scripts and source files always use LF line endings
+# (so they run correctly on the Raspberry Pi / Linux)
+*.sh   text eol=lf
+*.py   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
