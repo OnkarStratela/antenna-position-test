@@ -21,6 +21,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Test results & generated thumbnails (recorded locally on the Pi)
-results.xlsx
+# Generated thumbnail cache (regenerated from images/ on demand)
 .thumbs/

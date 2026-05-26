@@ -161,8 +161,10 @@ session.
 | antenna    | `Source_0` or `Source_1`. |
 | timestamp  | Timestamp reported by the C reader. |
 
-`results.xlsx` is git-ignored — it's the *raw test data* and lives only on
-the Pi. Copy it off when you want to analyse a campaign.
+`results.xlsx` is **tracked in git**, so you can sync test data between
+the Pi (where it's generated) and your laptop by committing and pushing
+from the Pi, then `git pull`-ing on the laptop. See the
+"Syncing results between the Pi and your computer" section below.
 
 ## LED behaviour
 
@@ -190,6 +192,54 @@ If you just want to verify the LED hardware without doing a test session:
 
 Don't run `rfid_led.py` and `antenna_test_logger.py` at the same time —
 they both spawn `rfid_reader` and only one can hold the USB serial port.
+
+## Syncing results between the Pi and your computer
+
+`results.xlsx` lives in the repo and is updated on the Pi during every
+test session. To bring it onto your laptop (or any other machine), just
+commit on the Pi and pull on the laptop.
+
+**One-time setup on the Pi** — tell git who you are and have it cache
+your GitHub Personal Access Token so you don't re-paste it on every
+push:
+
+```bash
+git config --global user.name  "Onkar"
+git config --global user.email "onkar@stratela.co.uk"
+git config --global credential.helper store
+```
+
+**After every session** (on the Pi), to push the latest `results.xlsx`:
+
+```bash
+cd ~/antenna-position-test
+git pull --rebase                   # pick up any code changes first
+git add results.xlsx
+git commit -m "Test results $(date +%Y-%m-%d_%H-%M)"
+git push
+```
+
+The first `git push` will prompt for your GitHub username + password.
+GitHub disabled real password auth in 2021, so use a **Personal Access
+Token** instead of your account password:
+
+1. github.com → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token (classic)
+2. Scope: tick `repo`
+3. Copy the token, paste it as the "Password" at the git prompt
+
+Because of `credential.helper store` above, the token is saved to
+`~/.git-credentials` and reused for subsequent pushes.
+
+**On your laptop**, just pull whenever you want the latest data:
+
+```bash
+cd path/to/antenna-position-test
+git pull
+```
+
+`results.xlsx` will be overwritten with the latest version from the
+Pi. Don't have it open in Excel while pulling — Excel locks the file
+and the pull will fail.
 
 ## Tweaks
 
