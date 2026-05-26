@@ -44,8 +44,11 @@ chmod +x compile.sh system.sh
 # 2. Build the C reader
 ./compile.sh
 
-# 3. Install Python deps for the logger
-pip3 install -r requirements.txt
+# 3. Install Python deps for the logger.
+#    On Pi OS Bookworm + later, pip3 is locked down by PEP 668 — use apt:
+sudo apt install -y python3-openpyxl python3-pil
+#    (or, if those packages aren't available on your distro:
+#       pip3 install --break-system-packages -r requirements.txt )
 ```
 
 ## Run a test session
@@ -156,6 +159,7 @@ they both spawn `rfid_reader` and only one can hold the USB serial port.
 
 - **`Failed to connect`** — check the USB cable, try `sudo chmod 666 /dev/ttyACM0`, or add your user to the `dialout` group: `sudo usermod -a -G dialout $USER`, then log out / log in.
 - **`rfid_reader' not found or not executable`** — run `./compile.sh` first.
-- **`ModuleNotFoundError: openpyxl`** — `pip3 install -r requirements.txt`.
+- **`ModuleNotFoundError: openpyxl`** — `sudo apt install -y python3-openpyxl python3-pil` (or, if not available on your OS, `pip3 install --break-system-packages -r requirements.txt`).
+- **`error: externally-managed-environment`** when running plain `pip3 install` — that's Pi OS Bookworm's PEP 668 lock. Same fix as above: prefer apt, or pass `--break-system-packages` to pip.
 - **Throw shows 0 tags even with containers present** — make sure you waited for the `LIVE` message before throwing; the C reader takes ~1–2 s to initialise.
 - **`results.xlsx` is open in Excel on another machine while the logger tries to save** — Excel locks the file. Close it on the other end, then start a fresh throw (or copy the file off the Pi before opening).
