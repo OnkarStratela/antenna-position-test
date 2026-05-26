@@ -21,9 +21,9 @@ Three antenna positions under test:
 |----------------------------|---------|
 | `rfid_reader.c`            | C program that talks to the CAEN reader, continuously inventories both antennas, and prints every **new unique** EPC with timestamp and antenna name. Dedupes for its entire process lifetime — see "How throws are isolated" below. |
 | `compile.sh`               | Builds `rfid_reader` from `rfid_reader.c` + the `SRC/` CAEN light library. |
-| `antenna_test_logger.py`   | **The test harness.** Wraps `rfid_reader`, presents a per-throw menu, hot-switches between the 3 setups, and appends results to `results.xlsx` with embedded setup photos. |
-| `rfid_led.py`              | Original LED bridge — drives the WS2812 strip green on every new tag. Use this *instead of* the logger when you just want LED feedback (the two scripts both want to own the reader subprocess and can't run simultaneously). |
-| `system.sh`                | One-shot runner for the original LED flow (compiles + launches `rfid_led.py`). |
+| `antenna_test_logger.py`   | **The test harness.** Wraps `rfid_reader`, presents a per-throw menu, hot-switches between the 3 setups, drives the same WS2812 + GPIO13 LED feedback as `rfid_led.py`, and appends results to `results.xlsx` with embedded setup photos. |
+| `rfid_led.py`              | Standalone LED-only bridge — drives the WS2812 strip green on every new tag, no logging. Useful as a quick LED hardware check when you don't need a test session. (Can't run at the same time as the logger — both spawn `rfid_reader`.) |
+| `system.sh`                | One-shot runner for the standalone LED-only flow (compiles + launches `rfid_led.py`). |
 | `requirements.txt`         | Python deps needed by the logger: `openpyxl`, `Pillow`. |
 | `images/`                  | The three reference photos, one per antenna setup. Embedded into the results spreadsheet. |
 | `SRC/`                     | CAEN RFID Light library sources/headers (do not modify). |
@@ -33,7 +33,7 @@ Three antenna positions under test:
 - Raspberry Pi CM4 + CM4 carrier board
 - CAEN R3100C-Lepton3 25 dBm RFID reader on `/dev/ttyACM0` (USB)
 - 2× UHF antennas on `Source_0` and `Source_1`
-- WS2812 LED strip on GPIO12 (PWM0) — only used by `rfid_led.py`, **not** by the logger.
+- WS2812 LED strip on GPIO12 (PWM0) + a held-on PWM LED on GPIO13 — visual feedback during throws.
 
 ## Setup
 
@@ -49,13 +49,24 @@ chmod +x compile.sh system.sh
 sudo apt install -y python3-openpyxl python3-pil
 #    (or, if those packages aren't available on your distro:
 #       pip3 install --break-system-packages -r requirements.txt )
+
+# 4. (Optional) Python deps for LED feedback — same packages rfid_led.py uses.
+#    Skip this if you don't need the LED strip / GPIO13 LED while testing.
+sudo apt install -y python3-gpiozero
+#    rpi_ws281x isn't in apt; install via pip with the PEP 668 override:
+sudo pip3 install --break-system-packages rpi_ws281x
 ```
 
 ## Run a test session
 
+The WS2812 LED strip needs root for PWM/DMA access, so launch with sudo:
+
 ```bash
-python3 antenna_test_logger.py
+sudo python3 antenna_test_logger.py
 ```
+
+(If you run without sudo it still works — you just won't get LED feedback;
+the spreadsheet is recorded exactly the same.)
 
 You'll be asked which of the three setups is currently mounted, then dropped
 into a per-throw menu. Sample session:
@@ -136,10 +147,25 @@ session.
 `results.xlsx` is git-ignored — it's the *raw test data* and lives only on
 the Pi. Copy it off when you want to analyse a campaign.
 
-## LED feedback during testing (optional)
+## LED behaviour
 
-If you'd rather have the WS2812 strip blink green on each tag (and you
-don't need the spreadsheet for that run), the original flow still works:
+`antenna_test_logger.py` mirrors the LED feedback from `rfid_led.py` for
+the entire session:
+
+- Idle (menu, between throws): WS2812 strip is solid **white**.
+- During a throw: a brief white off-pulse → solid **green** for 1 s → back
+  to white on **every new unique tag** the C reader reports. Multiple new
+  tags in quick succession produce that many distinct green blinks.
+- GPIO13 PWM LED is held on at 50% duty for the whole session.
+- On exit (`q`, Ctrl-C, or SIGTERM): strip OFF, GPIO13 forced LOW.
+
+If `rpi_ws281x` / `gpiozero` aren't installed, or the script isn't run as
+root, the LED layer is silently skipped and the logger keeps working —
+spreadsheet output is identical.
+
+### Standalone LED-only mode (no logging)
+
+If you just want to verify the LED hardware without doing a test session:
 
 ```bash
 ./system.sh                # builds + launches rfid_led.py
@@ -161,5 +187,6 @@ they both spawn `rfid_reader` and only one can hold the USB serial port.
 - **`rfid_reader' not found or not executable`** — run `./compile.sh` first.
 - **`ModuleNotFoundError: openpyxl`** — `sudo apt install -y python3-openpyxl python3-pil` (or, if not available on your OS, `pip3 install --break-system-packages -r requirements.txt`).
 - **`error: externally-managed-environment`** when running plain `pip3 install` — that's Pi OS Bookworm's PEP 668 lock. Same fix as above: prefer apt, or pass `--break-system-packages` to pip.
+- **`[LED] WARN: could not init WS2812 strip ... mmap() failed`** — you ran the logger without `sudo`. WS2812 PWM/DMA access needs root. Run with `sudo python3 antenna_test_logger.py`. The logger continues without LEDs in this case.
 - **Throw shows 0 tags even with containers present** — make sure you waited for the `LIVE` message before throwing; the C reader takes ~1–2 s to initialise.
 - **`results.xlsx` is open in Excel on another machine while the logger tries to save** — Excel locks the file. Close it on the other end, then start a fresh throw (or copy the file off the Pi before opening).

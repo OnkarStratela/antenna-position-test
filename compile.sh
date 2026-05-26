@@ -43,8 +43,9 @@ if [ $? -eq 0 ]; then
     
     echo "[Build] Ready to run!"
     echo ""
-    echo "To run RFID reader: ./rfid_reader"
-    echo "Or use:            ./run_system.sh"
+    echo "To run a test session: sudo python3 antenna_test_logger.py"
+    echo "Or LED-only mode:      ./system.sh"
+    echo "Raw reader only:       ./rfid_reader"
 else
     echo "[Build] Compilation failed!"
     echo "[Build] Check that you have gcc installed: sudo apt-get install build-essential"

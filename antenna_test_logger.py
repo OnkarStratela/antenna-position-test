@@ -14,9 +14,15 @@ spawns a *fresh* `rfid_reader` subprocess for every throw and kills it when
 the operator ends the throw. That way the same container can be thrown again
 in a later throw and will still be reported.
 
+The WS2812 LED strip + GPIO13 PWM LED behaviour from ``rfid_led.py`` is
+preserved here: solid WHITE while idle, a green blink for every new unique
+tag detected during a throw, OFF on exit. The LED layer is optional — if
+``rpi_ws281x`` / ``gpiozero`` aren't available (or the script isn't run
+with sudo), the logger still records throws but skips the LEDs.
+
 Operator workflow (no SSH-and-restart between throws)::
 
-    $ python3 antenna_test_logger.py
+    $ sudo python3 antenna_test_logger.py
 
     Available antenna setups:
       1. antennas_opposite
@@ -26,27 +32,25 @@ Operator workflow (no SSH-and-restart between throws)::
 
     [Setup: antennas_opposite]  ENTER = start throw  |  's' = switch setup  |  'q' = quit
     > <ENTER>
-    [antennas_opposite | Throw #1] scanning... press ENTER to end this throw
+    [antennas_opposite | Throw #1] starting reader... (press ENTER once you've thrown the containers to end)
         [RFID] TAG DETECTED: ABCDEF1234 [Source_0] [2026-05-26 16:10:00]
     > <ENTER>
     [antennas_opposite | Throw #1] DONE — 1 unique tag(s), 3.2 s
         logged to results.xlsx
-
-This script intentionally does NOT drive the WS2812 LED strip; for LED
-feedback during scanning, use the existing `rfid_led.py` instead. They are
-mutually exclusive at runtime because both want to own the rfid_reader
-subprocess.
 """
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -55,6 +59,18 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
+
+try:
+    from rpi_ws281x import PixelStrip, Color  # WS2812 strip on GPIO12
+except Exception:  # pragma: no cover — host without rpi_ws281x still runs
+    PixelStrip = None  # type: ignore[assignment]
+    Color = None  # type: ignore[assignment]
+
+try:
+    from gpiozero import PWMLED  # GPIO13 PWM LED held on during the session
+except Exception:  # pragma: no cover
+    PWMLED = None  # type: ignore[assignment]
+
 
 SCRIPT_DIR    = Path(__file__).resolve().parent
 RFID_BINARY   = SCRIPT_DIR / "rfid_reader"
@@ -110,6 +126,191 @@ TAGREADS_WIDTHS  = [16, 22, 10, 28, 12, 22]
 # row is sized to comfortably hold an 80-px-tall image.
 THUMB_HEIGHT_PX  = 80
 ROW_HEIGHT_PT    = 64
+
+
+# ─────────────────────── LED feedback (optional) ────────────────────────
+#
+# Mirrors rfid_led.py: WS2812 strip on GPIO12 + a held-on PWM LED on GPIO13.
+# Idle = solid WHITE; each new unique tag = brief WHITE off-pulse → GREEN
+# for GREEN_HOLD_SECONDS → back to WHITE. Multiple new tags in quick
+# succession produce N visible blinks. On exit, the strip is turned OFF
+# and GPIO13 is forced LOW at the SoC pin-mux level (so the PWM LED can't
+# latch HIGH after cleanup).
+#
+# All of this is best-effort: if rpi_ws281x or gpiozero aren't available,
+# the logger keeps running and just skips the LEDs.
+
+LED_COUNT       = 19
+LED_PIN         = 12
+LED_FREQ_HZ     = 600_000
+LED_DMA         = 10
+LED_BRIGHTNESS  = 225
+LED_INVERT      = False
+LED_CHANNEL     = 0
+
+PWM_LED_PIN         = 13
+PWM_LED_BRIGHTNESS  = 0.5
+
+GREEN_HEX = "#00FF00"
+WHITE_HEX = "#FFFFFF"
+OFF_HEX   = "#000000"
+
+GREEN_HOLD_SECONDS  = 1.0
+WHITE_FLASH_SECONDS = 0.10
+
+
+def _force_gpio_low(pin: int) -> None:
+    """Hardware-level final LOW for the GPIO13 PWM LED.
+
+    Last-resort cleanup: gpiozero / lgpio sometimes leave the SoC pin-mux
+    register configured as OUTPUT-HIGH when they release the GPIO chardev
+    claim on Pi OS Bookworm — which makes the LED snap to maximum
+    brightness as the program exits. ``pinctrl`` / ``raspi-gpio`` writes
+    the SoC pin-mux register directly, and that state persists after our
+    process exits.
+    """
+    for cmd in (
+        ["pinctrl", "set", str(pin), "op", "dl"],
+        ["raspi-gpio", "set", str(pin), "op", "dl"],
+    ):
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return
+        except Exception:
+            continue
+
+
+def _hex_to_color(hex_code: str):
+    r = int(hex_code[1:3], 16)
+    g = int(hex_code[3:5], 16)
+    b = int(hex_code[5:7], 16)
+    return Color(r, g, b)
+
+
+class LEDFeedback:
+    """WS2812 + GPIO13 PWM LED driver, behaving exactly like rfid_led.py
+    but spanning the entire test session (across all throws). Safe to
+    construct on any host: degrades to a no-op if the libraries can't
+    initialise (e.g. no rpi_ws281x, missing /dev/mem permissions, …)."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self._strip = None
+        self._pwm_led = None
+        self._queue: "queue.Queue[float]" = queue.Queue()
+        self._stop = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._GREEN = self._WHITE = self._OFF = None
+
+        if PixelStrip is None or Color is None:
+            print("[LED] rpi_ws281x not available; running without LED feedback.")
+            return
+
+        try:
+            self._strip = PixelStrip(
+                LED_COUNT, LED_PIN, LED_FREQ_HZ,
+                LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL,
+            )
+            self._strip.begin()
+            self._GREEN = _hex_to_color(GREEN_HEX)
+            self._WHITE = _hex_to_color(WHITE_HEX)
+            self._OFF   = _hex_to_color(OFF_HEX)
+            self._fill(self._WHITE)
+            self.enabled = True
+        except Exception as exc:
+            print(f"[LED] WARN: could not init WS2812 strip ({exc}); "
+                  f"continuing without LEDs. (Run with sudo for WS2812 access.)")
+            self._strip = None
+            return
+
+        # GPIO13 PWM LED: register the SoC-level cleanup BEFORE constructing
+        # PWMLED so it runs AFTER gpiozero's own atexit handler (LIFO order).
+        atexit.register(_force_gpio_low, PWM_LED_PIN)
+        if PWMLED is not None:
+            try:
+                self._pwm_led = PWMLED(PWM_LED_PIN)
+                self._pwm_led.value = PWM_LED_BRIGHTNESS
+                print(
+                    f"[LED] GPIO{PWM_LED_PIN} PWM LED ON at "
+                    f"{int(PWM_LED_BRIGHTNESS * 100)}% duty."
+                )
+            except Exception as exc:
+                print(f"[LED] WARN: could not init GPIO{PWM_LED_PIN} PWM LED: {exc}")
+                self._pwm_led = None
+
+        self._worker = threading.Thread(target=self._run_worker, daemon=True)
+        self._worker.start()
+
+    def notify_tag(self) -> None:
+        """Called for every NEW unique tag detected. Triggers one visible
+        green blink (or restarts the current one if we're still green)."""
+        if self.enabled:
+            self._queue.put(time.time())
+
+    def shutdown(self) -> None:
+        """Idempotent. Turns the strip OFF, releases the PWM LED, and
+        forces GPIO13 LOW at the SoC level."""
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2)
+        if self._strip is not None and self._OFF is not None:
+            try:
+                self._fill(self._OFF)
+            except Exception:
+                pass
+        if self._pwm_led is not None:
+            try:
+                self._pwm_led.value = 0.0
+                time.sleep(0.05)
+            except Exception:
+                pass
+            try:
+                self._pwm_led.close()
+            except Exception:
+                pass
+        _force_gpio_low(PWM_LED_PIN)
+
+    def _fill(self, color) -> None:
+        assert self._strip is not None
+        for i in range(self._strip.numPixels()):
+            self._strip.setPixelColor(i, color)
+        self._strip.show()
+
+    def _run_worker(self) -> None:
+        assert self._strip is not None
+        self._fill(self._WHITE)
+        while not self._stop.is_set():
+            try:
+                self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            # New tag → produce one green blink.
+            self._fill(self._WHITE)
+            time.sleep(WHITE_FLASH_SECONDS)
+            self._fill(self._GREEN)
+            green_until = time.time() + GREEN_HOLD_SECONDS
+            while not self._stop.is_set():
+                remaining = green_until - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    self._queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                # Another tag during the green window → restart blink.
+                self._fill(self._WHITE)
+                time.sleep(WHITE_FLASH_SECONDS)
+                self._fill(self._GREEN)
+                green_until = time.time() + GREEN_HOLD_SECONDS
+            self._fill(self._WHITE)
 
 
 # ─────────────────────────── data types ────────────────────────────
@@ -180,7 +381,6 @@ def thumb_for(setup: str) -> Optional[Path]:
     if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
         return dst
     img = PILImage.open(src)
-    # Preserve aspect ratio; cap height.
     img.thumbnail((10_000, THUMB_HEIGHT_PX))
     img.save(dst, "PNG")
     return dst
@@ -231,10 +431,11 @@ def append_throw(session_id: str, throw: ThrowResult) -> None:
 # ────────────────────── rfid_reader subprocess ──────────────────────
 
 
-def run_one_throw(setup: str, throw_num: int) -> ThrowResult:
+def run_one_throw(setup: str, throw_num: int, led: LEDFeedback) -> ThrowResult:
     """Spawn `rfid_reader`, stream its output, collect every reported tag
     detection until the operator presses ENTER, then kill the subprocess
-    and return the collected ThrowResult."""
+    and return the collected ThrowResult. Each new tag also drives a green
+    blink on the LED strip."""
     print(
         f"\n[{setup} | Throw #{throw_num}] starting reader... "
         f"(press ENTER once you've thrown the containers to end)"
@@ -250,7 +451,6 @@ def run_one_throw(setup: str, throw_num: int) -> ThrowResult:
 
     reads: List[TagRead] = []
     reader_ready = threading.Event()
-    reader_exited = threading.Event()
     start_time: List[dt.datetime] = []  # mutable slot set by reader thread
 
     def reader_thread() -> None:
@@ -274,7 +474,7 @@ def run_one_throw(setup: str, throw_num: int) -> ThrowResult:
                     antenna=m.group("antenna"),
                     ts=m.group("ts"),
                 ))
-        reader_exited.set()
+                led.notify_tag()
 
     t = threading.Thread(target=reader_thread, daemon=True)
     t.start()
@@ -338,42 +538,55 @@ def main() -> int:
     print(f"=== Antenna-position test session {session_id} ===")
     print(f"Results: {RESULTS_XLSX}")
 
-    setup_idx = pick_setup()
-    # Per-setup throw counters so each setup has its own #1, #2, ...
-    throw_counters = {s: 0 for s in SETUPS}
+    led = LEDFeedback()
 
-    while True:
-        setup = SETUPS[setup_idx]
-        prompt = (
-            f"\n[Setup: {setup}]  ENTER = start throw  |  "
-            f"'s' = switch setup  |  'q' = quit\n> "
-        )
-        try:
-            choice = input(prompt).strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print("\nBye.")
-            return 0
+    # Make sure LEDs are turned off on any abnormal exit (uncaught
+    # exception, SIGTERM, etc). Normal exit goes through the `finally`
+    # block below.
+    def _signal_shutdown(*_args) -> None:
+        led.shutdown()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _signal_shutdown)
 
-        if choice == "q":
-            print("Bye.")
-            return 0
-        if choice == "s":
-            setup_idx = pick_setup()
-            continue
+    try:
+        setup_idx = pick_setup()
+        # Per-setup throw counters so each setup has its own #1, #2, ...
+        throw_counters = {s: 0 for s in SETUPS}
 
-        throw_counters[setup] += 1
-        result = run_one_throw(setup, throw_counters[setup])
-        print(
-            f"[{setup} | Throw #{result.throw_num}] DONE — "
-            f"{len(result.unique_epcs)} unique tag(s), "
-            f"{result.duration_s:.1f} s"
-        )
-        try:
-            append_throw(session_id, result)
-            print(f"    logged to {RESULTS_XLSX.name}")
-        except Exception as exc:
-            print(f"    ERROR writing to {RESULTS_XLSX.name}: {exc}")
-            print("    (throw was NOT saved — fix the issue and retry)")
+        while True:
+            setup = SETUPS[setup_idx]
+            prompt = (
+                f"\n[Setup: {setup}]  ENTER = start throw  |  "
+                f"'s' = switch setup  |  'q' = quit\n> "
+            )
+            try:
+                choice = input(prompt).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\nBye.")
+                return 0
+
+            if choice == "q":
+                print("Bye.")
+                return 0
+            if choice == "s":
+                setup_idx = pick_setup()
+                continue
+
+            throw_counters[setup] += 1
+            result = run_one_throw(setup, throw_counters[setup], led)
+            print(
+                f"[{setup} | Throw #{result.throw_num}] DONE — "
+                f"{len(result.unique_epcs)} unique tag(s), "
+                f"{result.duration_s:.1f} s"
+            )
+            try:
+                append_throw(session_id, result)
+                print(f"    logged to {RESULTS_XLSX.name}")
+            except Exception as exc:
+                print(f"    ERROR writing to {RESULTS_XLSX.name}: {exc}")
+                print("    (throw was NOT saved — fix the issue and retry)")
+    finally:
+        led.shutdown()
 
 
 if __name__ == "__main__":
