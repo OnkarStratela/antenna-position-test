@@ -107,6 +107,8 @@ THROWS_HEADERS = [
     "epcs",
     "antennas_hit",
     "setup_photo",
+    "thrown_count",   # operator-reported ground truth for this throw
+    "hit_rate_pct",   # n_unique_tags / thrown_count * 100, when known
 ]
 
 TAGREADS_HEADERS = [
@@ -119,7 +121,7 @@ TAGREADS_HEADERS = [
 ]
 
 # Column widths (in Excel character units) for readability.
-THROWS_WIDTHS    = [16, 22, 10, 22, 22, 11, 8, 60, 22, 20]
+THROWS_WIDTHS    = [16, 22, 10, 22, 22, 11, 8, 60, 22, 20, 13, 13]
 TAGREADS_WIDTHS  = [16, 22, 10, 28, 12, 22]
 
 # Embedded-thumbnail height in pixels. Excel row height is in points; one
@@ -330,6 +332,8 @@ class ThrowResult:
     start_time: dt.datetime
     end_time: dt.datetime
     reads: List[TagRead] = field(default_factory=list)
+    # Filled in by the operator after the throw ends; None if they skipped.
+    thrown_count: Optional[int] = None
 
     @property
     def duration_s(self) -> float:
@@ -347,27 +351,65 @@ class ThrowResult:
     def antennas_hit(self) -> List[str]:
         return sorted({r.antenna for r in self.reads})
 
+    @property
+    def hit_rate_pct(self) -> Optional[float]:
+        """n_unique_tags / thrown_count, in percent, rounded to 1 dp.
+        Returns None when the operator didn't report a count, or reported 0."""
+        if self.thrown_count is None or self.thrown_count <= 0:
+            return None
+        return round(len(self.unique_epcs) / self.thrown_count * 100, 1)
+
 
 # ─────────────────────────── workbook I/O ───────────────────────────
 
 
 def ensure_workbook() -> None:
-    """Create `results.xlsx` with the two sheets if it doesn't already exist."""
-    if RESULTS_XLSX.exists():
+    """Create `results.xlsx` with the two sheets if it doesn't already exist,
+    or upgrade an older file in place if new columns have been added to
+    THROWS_HEADERS / TAGREADS_HEADERS since the file was created. Header
+    cells that are already populated are left alone (so manual renames
+    survive); only empty header cells get filled in."""
+    if not RESULTS_XLSX.exists():
+        wb = Workbook()
+        throws = wb.active
+        throws.title = "Throws"
+        throws.append(THROWS_HEADERS)
+        for col_idx, w in enumerate(THROWS_WIDTHS, start=1):
+            throws.column_dimensions[get_column_letter(col_idx)].width = w
+
+        tagreads = wb.create_sheet("TagReads")
+        tagreads.append(TAGREADS_HEADERS)
+        for col_idx, w in enumerate(TAGREADS_WIDTHS, start=1):
+            tagreads.column_dimensions[get_column_letter(col_idx)].width = w
+
+        wb.save(RESULTS_XLSX)
         return
-    wb = Workbook()
-    throws = wb.active
-    throws.title = "Throws"
-    throws.append(THROWS_HEADERS)
-    for col_idx, w in enumerate(THROWS_WIDTHS, start=1):
-        throws.column_dimensions[get_column_letter(col_idx)].width = w
 
-    tagreads = wb.create_sheet("TagReads")
-    tagreads.append(TAGREADS_HEADERS)
-    for col_idx, w in enumerate(TAGREADS_WIDTHS, start=1):
-        tagreads.column_dimensions[get_column_letter(col_idx)].width = w
+    wb = load_workbook(RESULTS_XLSX)
+    changed = False
 
-    wb.save(RESULTS_XLSX)
+    def upgrade(sheet_name: str, headers: List[str], widths: List[int]) -> bool:
+        nonlocal changed
+        if sheet_name not in wb.sheetnames:
+            return False
+        ws = wb[sheet_name]
+        local_changed = False
+        for i, h in enumerate(headers, start=1):
+            existing = ws.cell(row=1, column=i).value
+            if existing is None or existing == "":
+                ws.cell(row=1, column=i, value=h)
+                local_changed = True
+        for col_idx, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = w
+        if local_changed:
+            changed = True
+        return local_changed
+
+    upgrade("Throws", THROWS_HEADERS, THROWS_WIDTHS)
+    upgrade("TagReads", TAGREADS_HEADERS, TAGREADS_WIDTHS)
+
+    if changed:
+        wb.save(RESULTS_XLSX)
 
 
 def thumb_for(setup: str) -> Optional[Path]:
@@ -406,6 +448,8 @@ def append_throw(session_id: str, throw: ThrowResult) -> None:
         ", ".join(throw.unique_epcs),
         ", ".join(throw.antennas_hit),
         "",
+        throw.thrown_count if throw.thrown_count is not None else "",
+        throw.hit_rate_pct if throw.hit_rate_pct is not None else "",
     ])
     throws.row_dimensions[next_row].height = ROW_HEIGHT_PT
 
@@ -527,6 +571,30 @@ def pick_setup() -> int:
         print("  Invalid choice, try again.")
 
 
+def prompt_thrown_count() -> Optional[int]:
+    """Ask the operator how many containers/tags they just threw. Returns
+    the integer they entered, or None if they pressed ENTER to skip or hit
+    EOF/Ctrl-C. Re-prompts on invalid input."""
+    while True:
+        try:
+            raw = input(
+                "    How many containers did you throw? (ENTER to skip): "
+            ).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            print(f"    '{raw}' isn't a whole number. Try again, or ENTER to skip.")
+            continue
+        if n < 0:
+            print("    Must be 0 or positive. Try again, or ENTER to skip.")
+            continue
+        return n
+
+
 def main() -> int:
     if not RFID_BINARY.is_file() or not os.access(RFID_BINARY, os.X_OK):
         print(f"ERROR: '{RFID_BINARY}' not found or not executable.")
@@ -579,6 +647,12 @@ def main() -> int:
                 f"{len(result.unique_epcs)} unique tag(s), "
                 f"{result.duration_s:.1f} s"
             )
+            result.thrown_count = prompt_thrown_count()
+            if result.hit_rate_pct is not None:
+                print(
+                    f"    {len(result.unique_epcs)}/{result.thrown_count} "
+                    f"detected = {result.hit_rate_pct:.1f}% hit rate"
+                )
             try:
                 append_throw(session_id, result)
                 print(f"    logged to {RESULTS_XLSX.name}")

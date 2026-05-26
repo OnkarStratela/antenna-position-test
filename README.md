@@ -101,8 +101,15 @@ Select setup [1/2/3]: 2
     [RFID] TAG DETECTED: E2806995000040034A1E7BB2 [Source_1] [2026-05-26 16:12:15]
 <ENTER>
 [antennas_vertical | Throw #1] DONE — 2 unique tag(s), 4.3 s
+    How many containers did you throw? (ENTER to skip): 3
+    2/3 detected = 66.7% hit rate
     logged to results.xlsx
 ```
+
+The "How many containers did you throw?" prompt runs after every throw.
+Enter the number you actually threw and the logger computes the hit rate;
+press ENTER alone to skip the count for that throw (both `thrown_count`
+and `hit_rate_pct` are then left blank in the spreadsheet).
 
 Number of throws per session, number of containers per throw, and which
 setup is mounted are all free — pick `'s'` from the menu any time to switch
@@ -140,6 +147,8 @@ session.
 | epcs           | Comma-separated list of those EPCs. |
 | antennas_hit   | Which sources reported anything (`Source_0`, `Source_1`, or both). |
 | setup_photo    | Embedded thumbnail of the corresponding `images/<setup>.png`. |
+| thrown_count   | How many containers the operator reports throwing for this throw (entered at the prompt right after the throw ends; blank if skipped). |
+| hit_rate_pct   | `n_unique_tags / thrown_count * 100`, rounded to 1 dp. Blank if `thrown_count` is blank or 0. |
 
 ### Sheet `TagReads` — one row per first detection
 
