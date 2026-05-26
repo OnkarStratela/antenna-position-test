@@ -1,89 +1,161 @@
-# RFID Reader + WS2812 LED Feedback
+# Antenna Position Test
 
-This folder is the **RFID half** of the project (Raspberry Pi CM4 + CM4 carrier
-board + CAEN R3100C-Lepton3 reader + 2 antennas). It scans for **unique** EPC
-tags via the CAEN reader, holds an attached WS2812 LED strip on solid **white**
-while idle, and **blinks it green for ~1 s on every new unique tag** — so the
-operator gets a visual count of containers as they're scanned.
+Test harness for comparing **three dual-antenna mounting positions** in an
+RFID bin. For each test session the operator drops batches of tagged
+containers into the bin; the program records every throw — which tags were
+detected, on which antenna, how long the throw lasted — and appends it to a
+single master Excel workbook with the antenna-position photo embedded next
+to the row.
+
+Three antenna positions under test:
+
+| Setup name              | What it means                                  |
+|-------------------------|------------------------------------------------|
+| `antennas_opposite`     | Two antennas mounted facing each other across the bin (see `images/antennas_opposite.png`). |
+| `antennas_vertical`     | Two antennas stacked vertically on the same wall (see `images/antennas_vertical.png`).      |
+| `antennas_horizontal`   | Two antennas spaced horizontally on the same wall (see `images/antennas_horizontal.png`).   |
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `rfid_reader.c`     | C program that talks to the CAEN reader, performs continuous inventory on both antennas, dedupes via a `seen_tags[]` table until **no tag reads occur for 15 s**, then clears that list so the same EPCs can be reported again; prints each new detection with timestamp and antenna (`Source_0` / `Source_1`). |
-| `compile.sh`        | Builds `rfid_reader` from `rfid_reader.c` + the `SRC/` CAEN light library. |
-| `rfid_led.py`       | Python bridge: launches the `rfid_reader` binary, parses its stdout, holds the WS2812 strip white while idle, and blinks it green for 1 s on every new unique tag. |
-| `system.sh`         | One-shot runner: checks the `SRC/` library, compiles, and launches `rfid_led.py` (with `sudo` so the LED PWM/DMA can be accessed). |
-| `SRC/`              | CAEN RFID Light library sources/headers (do not modify). |
+| File                       | Purpose |
+|----------------------------|---------|
+| `rfid_reader.c`            | C program that talks to the CAEN reader, continuously inventories both antennas, and prints every **new unique** EPC with timestamp and antenna name. Dedupes for its entire process lifetime — see "How throws are isolated" below. |
+| `compile.sh`               | Builds `rfid_reader` from `rfid_reader.c` + the `SRC/` CAEN light library. |
+| `antenna_test_logger.py`   | **The test harness.** Wraps `rfid_reader`, presents a per-throw menu, hot-switches between the 3 setups, and appends results to `results.xlsx` with embedded setup photos. |
+| `rfid_led.py`              | Original LED bridge — drives the WS2812 strip green on every new tag. Use this *instead of* the logger when you just want LED feedback (the two scripts both want to own the reader subprocess and can't run simultaneously). |
+| `system.sh`                | One-shot runner for the original LED flow (compiles + launches `rfid_led.py`). |
+| `requirements.txt`         | Python deps needed by the logger: `openpyxl`, `Pillow`. |
+| `images/`                  | The three reference photos, one per antenna setup. Embedded into the results spreadsheet. |
+| `SRC/`                     | CAEN RFID Light library sources/headers (do not modify). |
 
 ## Hardware
 
 - Raspberry Pi CM4 + CM4 carrier board
 - CAEN R3100C-Lepton3 25 dBm RFID reader on `/dev/ttyACM0` (USB)
 - 2× UHF antennas on `Source_0` and `Source_1`
-- WS2812 LED strip on **GPIO12 (PWM0)**, 19 LEDs (configured in `rfid_led.py`)
+- WS2812 LED strip on GPIO12 (PWM0) — only used by `rfid_led.py`, **not** by the logger.
 
-## Build & Run
+## Setup
 
 ```bash
 # 1. Make scripts executable (first time only)
 chmod +x compile.sh system.sh
 
-# 2. Make sure the Python LED library is installed on the Pi
-sudo pip3 install rpi_ws281x
+# 2. Build the C reader
+./compile.sh
 
-# 3. Run everything
-./system.sh
+# 3. Install Python deps for the logger
+pip3 install -r requirements.txt
 ```
 
-`system.sh` will:
+## Run a test session
 
-1. Verify the `SRC/` CAEN library files are present.
-2. Check USB permissions for `/dev/ttyACM0` / `/dev/ttyUSB0`.
-3. Compile `rfid_reader`.
-4. Launch `rfid_led.py`, which spawns `rfid_reader` and watches its output.
-
-## What you'll see
-
-```
-[RFID] TAG DETECTED: E20000172211010418905449 [Source_0] [2026-04-29 14:32:45]
-[LED-RFID] Tags scanned: 1
+```bash
+python3 antenna_test_logger.py
 ```
 
-LED behaviour:
+You'll be asked which of the three setups is currently mounted, then dropped
+into a per-throw menu. Sample session:
 
-- **At startup / when idle:** the whole strip is solid **white** (`#FFFFFF`).
-- **Each new unique tag:** a brief white off-pulse (~100 ms) → solid **green**
-  (`#00FF00`) for **1 s** → back to white.
-- **Multiple tags in quick succession:** every new tag cuts the current green
-  pulse short and starts a fresh one, so scanning N containers in a row
-  produces N distinct green blinks — a visual counter for the operator. The
-  running total is also printed in the terminal next to each tag line.
+```
+=== Antenna-position test session 20260526-161205 ===
+Results: /home/stratela/antenna-position-test/results.xlsx
 
-Press **Ctrl+C** to stop. The bridge sends `SIGINT` to the C reader, waits for
-it to disconnect cleanly, then turns the LEDs off (`#000000`).
+Available antenna setups:
+  1. antennas_opposite
+  2. antennas_vertical
+  3. antennas_horizontal
+Select setup [1/2/3]: 2
+
+[Setup: antennas_vertical]  ENTER = start throw  |  's' = switch setup  |  'q' = quit
+> <ENTER>
+
+[antennas_vertical | Throw #1] starting reader... (press ENTER once you've thrown the containers to end)
+    [RFID] Connecting to CAEN reader on /dev/ttyACM0 at 921600 baud...
+    [RFID] Power set to 316 mW
+    [RFID] Scanning on Source_0 and Source_1 every 10 ms — press Ctrl+C to stop
+[antennas_vertical | Throw #1] LIVE — drop containers, press ENTER to end.
+    [RFID] TAG DETECTED: E280699500004003D9D7C8B0 [Source_0] [2026-05-26 16:12:14]
+    [RFID] TAG DETECTED: E2806995000040034A1E7BB2 [Source_1] [2026-05-26 16:12:15]
+<ENTER>
+[antennas_vertical | Throw #1] DONE — 2 unique tag(s), 4.3 s
+    logged to results.xlsx
+```
+
+Number of throws per session, number of containers per throw, and which
+setup is mounted are all free — pick `'s'` from the menu any time to switch
+to a different antenna position and keep going.
+
+Press `'q'` (or Ctrl-C) at the menu to end the session cleanly.
+
+## How throws are isolated
+
+`rfid_reader` only ever prints each EPC once per process lifetime — so if
+the same tag is thrown twice, only the first throw would see it. To make
+every throw a clean slate, the logger **spawns a fresh `rfid_reader`
+subprocess for every throw** and kills it cleanly (SIGINT → graceful
+disconnect) when you press ENTER. The cost is ~1–2 s of reader startup at
+the beginning of each throw; the logger displays `LIVE — drop containers,
+press ENTER to end.` once the reader is actually scanning, so you know
+when it's safe to throw.
+
+## What gets recorded
+
+A single file `results.xlsx` at the repo root, appended to across every
+session.
+
+### Sheet `Throws` — one row per throw
+
+| Column         | Description |
+|----------------|-------------|
+| session_id     | Timestamp of the test session, e.g. `20260526-161205`. |
+| setup          | `antennas_opposite` / `antennas_vertical` / `antennas_horizontal`. |
+| throw_num      | 1-based throw counter, **independent per setup** (each setup has its own #1, #2, ...). |
+| start_time     | When the reader went LIVE for this throw. |
+| end_time       | When the operator pressed ENTER. |
+| duration_s     | end − start, in seconds. |
+| n_unique_tags  | Number of distinct EPCs detected during this throw. |
+| epcs           | Comma-separated list of those EPCs. |
+| antennas_hit   | Which sources reported anything (`Source_0`, `Source_1`, or both). |
+| setup_photo    | Embedded thumbnail of the corresponding `images/<setup>.png`. |
+
+### Sheet `TagReads` — one row per first detection
+
+| Column     | Description |
+|------------|-------------|
+| session_id | Same as on the Throws sheet. |
+| setup      | Same. |
+| throw_num  | Same. |
+| epc        | The detected tag EPC (hex). |
+| antenna    | `Source_0` or `Source_1`. |
+| timestamp  | Timestamp reported by the C reader. |
+
+`results.xlsx` is git-ignored — it's the *raw test data* and lives only on
+the Pi. Copy it off when you want to analyse a campaign.
+
+## LED feedback during testing (optional)
+
+If you'd rather have the WS2812 strip blink green on each tag (and you
+don't need the spreadsheet for that run), the original flow still works:
+
+```bash
+./system.sh                # builds + launches rfid_led.py
+```
+
+Don't run `rfid_led.py` and `antenna_test_logger.py` at the same time —
+they both spawn `rfid_reader` and only one can hold the USB serial port.
 
 ## Tweaks
 
-- LED count / pin / brightness: edit the `LED_*` constants at the top of
-  `rfid_led.py`.
-- Green blink length: change `GREEN_HOLD_SECONDS` in `rfid_led.py`.
-- Gap between back-to-back blinks: change `WHITE_FLASH_SECONDS` in
-  `rfid_led.py`.
-- RFID output power: edit `POWER_MW` in `rfid_reader.c`, then re-run
-  `./compile.sh` (or just `./system.sh`).
-- Time between full **two-antenna** poll rounds: edit `SCAN_MS` (milliseconds)
-  in `rfid_reader.c`, then recompile.
-- How long with **no tag reads** before dedupe clears so repeats count again:
-  edit `IDLE_RESET_SEC` in `rfid_reader.c`, then recompile.
+- RFID output power: edit `POWER_MW` in `rfid_reader.c`, then `./compile.sh`.
+- Two-antenna poll interval: edit `SCAN_MS` (ms) in `rfid_reader.c`, then recompile.
+- Embedded thumbnail size: `THUMB_HEIGHT_PX` / `ROW_HEIGHT_PT` in `antenna_test_logger.py`.
+- Add a fourth setup: append it to `SETUPS` in `antenna_test_logger.py`, drop a matching `images/<name>.png`, done.
 
 ## Troubleshooting
 
-- **`Failed to connect`** — check the USB cable, try `sudo chmod 666 /dev/ttyACM0`,
-  or add your user to the `dialout` group: `sudo usermod -a -G dialout $USER`
-  then log out / log in.
-- **`mmap() failed` from rpi_ws281x** — you must run as root (`sudo`),
-  which `system.sh` already handles.
-- **Reader connects but no tags appear** — bring a tag closer, confirm both
-  antennas are connected, or increase `POWER_MW` in `rfid_reader.c` (within
-  hardware limits), then recompile.
+- **`Failed to connect`** — check the USB cable, try `sudo chmod 666 /dev/ttyACM0`, or add your user to the `dialout` group: `sudo usermod -a -G dialout $USER`, then log out / log in.
+- **`rfid_reader' not found or not executable`** — run `./compile.sh` first.
+- **`ModuleNotFoundError: openpyxl`** — `pip3 install -r requirements.txt`.
+- **Throw shows 0 tags even with containers present** — make sure you waited for the `LIVE` message before throwing; the C reader takes ~1–2 s to initialise.
+- **`results.xlsx` is open in Excel on another machine while the logger tries to save** — Excel locks the file. Close it on the other end, then start a fresh throw (or copy the file off the Pi before opening).
