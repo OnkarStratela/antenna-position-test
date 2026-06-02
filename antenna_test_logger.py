@@ -412,6 +412,37 @@ def ensure_workbook() -> None:
         wb.save(RESULTS_XLSX)
 
 
+def load_existing_throw_counts() -> dict:
+    """Read the Throws sheet and return ``{setup: total_throws_logged}`` so
+    the per-setup throw counter resumes from where the last session left
+    off (instead of resetting to 0 every run)."""
+    counts = {s: 0 for s in SETUPS}
+    if not RESULTS_XLSX.exists():
+        return counts
+    try:
+        wb = load_workbook(RESULTS_XLSX, read_only=True)
+    except Exception:
+        return counts
+    if "Throws" not in wb.sheetnames:
+        wb.close()
+        return counts
+    ws = wb["Throws"]
+    rows = ws.iter_rows(min_row=2, values_only=True)
+    for row in rows:
+        if not row:
+            continue
+        # column layout: session_id, setup, throw_num, ...
+        setup = row[1] if len(row) > 1 else None
+        if setup in counts:
+            counts[setup] += 1
+    wb.close()
+    return counts
+
+
+def format_counts(counts: dict) -> str:
+    return " | ".join(f"{s}: {counts.get(s, 0)}" for s in SETUPS)
+
+
 def thumb_for(setup: str) -> Optional[Path]:
     """Return a cached thumbnail path for `setup`, regenerating if the
     source photo has been updated. Returns None if no source image exists."""
@@ -617,9 +648,12 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _signal_shutdown)
 
     try:
+        # Per-setup throw counters resume from previously-logged throws so
+        # the live tally is cumulative across runs (not reset every start).
+        throw_counters = load_existing_throw_counts()
+        print(f"[Live count] {format_counts(throw_counters)}")
+
         setup_idx = pick_setup()
-        # Per-setup throw counters so each setup has its own #1, #2, ...
-        throw_counters = {s: 0 for s in SETUPS}
 
         while True:
             setup = SETUPS[setup_idx]
@@ -659,6 +693,7 @@ def main() -> int:
             except Exception as exc:
                 print(f"    ERROR writing to {RESULTS_XLSX.name}: {exc}")
                 print("    (throw was NOT saved — fix the issue and retry)")
+            print(f"[Live count] {format_counts(throw_counters)}")
     finally:
         led.shutdown()
 
