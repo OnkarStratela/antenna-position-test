@@ -602,6 +602,27 @@ def pick_setup() -> int:
         print("  Invalid choice, try again.")
 
 
+def prompt_save_throw() -> bool:
+    """Ask the operator whether to save this throw to results.xlsx.
+
+    Defaults to YES on plain ENTER (one keystroke for the common case).
+    Only an explicit 'n' / 'no' discards the throw. KeyboardInterrupt /
+    EOF also defaults to YES so a stray Ctrl-C doesn't accidentally lose
+    a real throw."""
+    while True:
+        try:
+            raw = input(
+                "    Save this throw to results.xlsx? [Y/n]: "
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return True
+        if raw in {"", "y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print(f"    '{raw}' — please answer y or n (ENTER = yes).")
+
+
 def prompt_thrown_count() -> Optional[int]:
     """Ask the operator how many containers/tags they just threw. Returns
     the integer they entered, or None if they pressed ENTER to skip or hit
@@ -681,6 +702,15 @@ def main() -> int:
                 f"{len(result.unique_epcs)} unique tag(s), "
                 f"{result.duration_s:.1f} s"
             )
+            if not prompt_save_throw():
+                # Operator chose not to save this throw — roll the
+                # per-setup counter back so the next throw on this setup
+                # reuses the same number, and skip the thrown_count
+                # prompt and the spreadsheet append.
+                throw_counters[setup] -= 1
+                print("    discarded — not saved to results.xlsx")
+                print(f"[Live count] {format_counts(throw_counters)}")
+                continue
             result.thrown_count = prompt_thrown_count()
             if result.hit_rate_pct is not None:
                 print(
